@@ -78,6 +78,8 @@ class AppController(QObject):
         self.flyout_window.refresh_requested.connect(self.engine.refresh_now)
         self.flyout_window.settings_requested.connect(self.open_settings)
         self.flyout_window.mode_changed.connect(self._on_mode_changed_by_ui)
+        self.flyout_window.account_refresh_requested.connect(self.engine.refresh_offline_accounts)
+        self.engine.accounts_refreshed.connect(self.flyout_window.on_accounts_refreshed)
 
         # Dock actions
         self.dock_widget.clicked.connect(self.toggle_flyout)

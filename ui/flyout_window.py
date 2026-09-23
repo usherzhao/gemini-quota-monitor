@@ -159,11 +159,13 @@ class AccountPoolCardWidget(QFrame):
         self,
         record: AccountQuotaRecord,
         on_delete: Optional[Callable[[str], None]] = None,
+        on_refresh: Optional[Callable[[str], None]] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.record = record
         self.on_delete = on_delete
+        self.on_refresh = on_refresh
         self._init_ui()
 
     def _init_ui(self):
@@ -230,6 +232,28 @@ class AccountPoolCardWidget(QFrame):
             header_row.addWidget(info_lbl)
 
         header_row.addStretch()
+
+        # Single Account API Refresh Button (if offline and has token)
+        if not self.record.is_active and self.record.has_api_token and self.on_refresh:
+            self.btn_refresh = QPushButton("🔄")
+            self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_refresh.setToolTip("通过 Google 官方 API 刷新此离线账号的真实额度")
+            self.btn_refresh.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #38BDF8;
+                    border: 1px solid #0369A1;
+                    border-radius: 6px;
+                    padding: 3px 6px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #0369A1;
+                    color: #FFFFFF;
+                }
+            """)
+            self.btn_refresh.clicked.connect(self._on_single_refresh_clicked)
+            header_row.addWidget(self.btn_refresh)
 
         # Copy Email Button
         self.btn_copy = QPushButton("📋 复制")
@@ -352,6 +376,35 @@ class AccountPoolCardWidget(QFrame):
 
         layout.addLayout(wk_row)
 
+        # 4. Status Footer Row
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 2, 0, 0)
+        footer_row.setSpacing(6)
+
+        if self.record.is_active:
+            status_text = "🟢 IDE 进程实时直连"
+            status_color = "#38BDF8"
+        elif self.record.has_api_token:
+            sync_time = self.record.last_api_refresh[11:19] if self.record.last_api_refresh and len(self.record.last_api_refresh) >= 19 else "刚刚"
+            status_text = f"🌐 官方 API 真实同步 (更新于 {sync_time})"
+            status_color = "#34D399"
+        else:
+            status_text = "⏱️ 倒计时推算中 (切换至该账号后自动激活真实API)"
+            status_color = "#94A3B8"
+
+        lbl_src = QLabel(status_text)
+        lbl_src.setStyleSheet(f"color: {status_color}; font-size: 11px;")
+        footer_row.addWidget(lbl_src)
+        footer_row.addStretch()
+        layout.addLayout(footer_row)
+
+    def _on_single_refresh_clicked(self):
+        if hasattr(self, "btn_refresh"):
+            self.btn_refresh.setText("⏳")
+            self.btn_refresh.setEnabled(False)
+        if self.on_refresh:
+            self.on_refresh(self.record.email)
+
     def _copy_email(self):
         cb = QGuiApplication.clipboard()
         if cb:
@@ -395,6 +448,7 @@ class FlyoutWindow(QWidget):
     refresh_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     mode_changed = pyqtSignal(str)
+    account_refresh_requested = pyqtSignal(str)  # email or "" for all
 
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
@@ -605,9 +659,10 @@ class FlyoutWindow(QWidget):
         acc_header_row.addWidget(self.acc_summary_lbl)
         acc_header_row.addStretch()
 
-        btn_acc_refresh = QPushButton("🔄 刷新推算")
-        btn_acc_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_acc_refresh.setStyleSheet("""
+        self.btn_acc_refresh = QPushButton("🔄 刷新真实额度")
+        self.btn_acc_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_acc_refresh.setToolTip("通过 Google 官方 API 刷新所有离线账号的最新真实配额")
+        self.btn_acc_refresh.setStyleSheet("""
             QPushButton {
                 background-color: #1E293B;
                 color: #CBD5E1;
@@ -622,8 +677,8 @@ class FlyoutWindow(QWidget):
                 color: #F8FAFC;
             }
         """)
-        btn_acc_refresh.clicked.connect(self._render_accounts_tab)
-        acc_header_row.addWidget(btn_acc_refresh)
+        self.btn_acc_refresh.clicked.connect(self._on_request_refresh_all_accounts)
+        acc_header_row.addWidget(self.btn_acc_refresh)
 
         page_accounts_layout.addLayout(acc_header_row)
 
@@ -789,6 +844,9 @@ class FlyoutWindow(QWidget):
         if tab_name == "accounts":
             self.stacked_widget.setCurrentIndex(1)
             self._render_accounts_tab()
+            # If any offline accounts have an API token, trigger auto refresh in background
+            if any(acc.has_api_token for acc in self.account_manager.accounts.values() if not acc.is_active):
+                self.account_refresh_requested.emit("")
         else:
             self.stacked_widget.setCurrentIndex(0)
             if self.current_snapshot:
@@ -987,7 +1045,7 @@ class FlyoutWindow(QWidget):
             t1.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_lay.addWidget(t1)
 
-            t2 = QLabel("在 Antigravity IDE 中切换不同 Google 账号，\n本程序会自动捕获配额与重置时间，并在后台持续推算满血恢复倒计时。")
+            t2 = QLabel("在 Antigravity IDE 中切换不同 Google 账号，\n本程序会自动捕获凭据与配额，并在后台自动刷新真实额度。")
             t2.setStyleSheet("color: #94A3B8; font-size: 12px; margin-top: 6px;")
             t2.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_lay.addWidget(t2)
@@ -999,15 +1057,32 @@ class FlyoutWindow(QWidget):
                 card = AccountPoolCardWidget(
                     record=acc,
                     on_delete=self._on_delete_account,
+                    on_refresh=self._on_request_refresh_single_account,
                 )
                 self.acc_cards_layout.addWidget(card)
 
             num_acc = len(accounts)
-            cards_h = num_acc * 85 + max(0, num_acc - 1) * 8
+            cards_h = num_acc * 125 + max(0, num_acc - 1) * 8
 
-        self.acc_scroll_area.setFixedHeight(min(360, max(90, cards_h)))
-        target_h = 205 + min(360, max(90, cards_h))
+        self.acc_scroll_area.setFixedHeight(min(390, max(90, cards_h)))
+        target_h = 205 + min(390, max(90, cards_h))
         self._adjust_window_height(target_h)
+
+    def _on_request_refresh_all_accounts(self):
+        if hasattr(self, "btn_acc_refresh"):
+            self.btn_acc_refresh.setText("⏳ 正在查询...")
+            self.btn_acc_refresh.setEnabled(False)
+        self.account_refresh_requested.emit("")
+
+    def _on_request_refresh_single_account(self, email: str):
+        self.account_refresh_requested.emit(email)
+
+    def on_accounts_refreshed(self, success: bool, count: int):
+        if hasattr(self, "btn_acc_refresh"):
+            self.btn_acc_refresh.setText("🔄 刷新真实额度")
+            self.btn_acc_refresh.setEnabled(True)
+        if self.current_tab == "accounts":
+            self._render_accounts_tab()
 
     def _on_delete_account(self, email: str):
         self.account_manager.remove_account(email)

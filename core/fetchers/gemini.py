@@ -278,12 +278,18 @@ class GeminiQuotaFetcher:
                     if user_email:
                         try:
                             from core.account_manager import get_account_manager
+                            from utils.antigravity_auth import extract_antigravity_tokens
                             acc_mgr = get_account_manager()
 
-                            item_5h = next((it for it in items if "5h" in it.id.lower()), None)
-                            item_week = next((it for it in items if "weekly" in it.id.lower() or "week" in it.id.lower()), None)
+                            _, extracted_rt = extract_antigravity_tokens()
+                            if extracted_rt and not cfg.refresh_token:
+                                cfg.refresh_token = extracted_rt
+                                self.config_manager.save()
+
+                            item_5h = next((it for it in items if "5h" in it.id.lower() and "claude" not in it.id.lower()), None)
+                            item_week = next((it for it in items if ("weekly" in it.id.lower() or "week" in it.id.lower()) and "claude" not in it.id.lower()), None)
                             item_c5h = next((it for it in items if "claude" in it.id.lower() and "5h" in it.id.lower()), None)
-                            item_cweek = next((it for it in items if "claude" in it.id.lower() and "week" in it.id.lower()), None)
+                            item_cweek = next((it for it in items if "claude" in it.id.lower() and ("weekly" in it.id.lower() or "week" in it.id.lower())), None)
 
                             acc_mgr.update_or_add_account(
                                 email=user_email,
@@ -298,6 +304,8 @@ class GeminiQuotaFetcher:
                                 claude_weekly_remaining=item_cweek.remaining if item_cweek else 100.0,
                                 claude_weekly_reset_time=item_cweek.reset_time if item_cweek else None,
                                 is_active=True,
+                                refresh_token=extracted_rt or "",
+                                quota_source="api",
                             )
                         except Exception as acc_err:
                             logger.debug(f"AccountManager update error: {acc_err}")
@@ -573,3 +581,95 @@ class GeminiQuotaFetcher:
             items=[item_5h, item_weekly],
             status="simulated",
         )
+
+    def fetch_quota_via_refresh_token(self, refresh_token: str) -> Optional[List[QuotaItem]]:
+        """
+        Fetches live quota snapshot from Google CloudCode-PA APIs using a refresh_token.
+        Handles proxy fallbacks smoothly.
+        """
+        if not refresh_token or not refresh_token.strip():
+            return None
+
+        # 1. Exchange refresh_token for access_token with proxy fallback
+        token_data = None
+        try:
+            token_data = self.oauth_client.refresh_access_token(refresh_token)
+        except Exception as e:
+            logger.debug(f"Refresh with proxy failed ({e}), attempting direct connection...")
+            try:
+                direct_client = GoogleOAuthClient(proxy_url=None)
+                token_data = direct_client.refresh_access_token(refresh_token)
+            except Exception as direct_err:
+                logger.warning(f"Failed to refresh access token for offline account: {direct_err}")
+                return None
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return None
+
+        # 2. Build session
+        session = self._build_session()
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": ANTIGRAVITY_USER_AGENT,
+        }
+
+        # 3. Resolve project ID
+        project_id = DEFAULT_PROJECT_ID
+        for endpoint in CODE_ASSIST_ENDPOINTS:
+            try:
+                resp = session.post(endpoint, json={"metadata": {"ideType": "ANTIGRAVITY"}}, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for key in ["cloudaicompanionProject", "projectId", "project"]:
+                        val = data.get(key)
+                        if isinstance(val, str) and val.strip():
+                            project_id = val.strip()
+                            break
+                    if project_id != DEFAULT_PROJECT_ID:
+                        break
+            except Exception:
+                pass
+
+        # 4. Fetch User Quota Summary
+        body = {"project": project_id}
+        payload = None
+        for endpoint in QUOTA_SUMMARY_ENDPOINTS:
+            try:
+                resp = session.post(endpoint, json=body, headers=headers, timeout=12)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    break
+            except Exception:
+                # If proxy connection failed, retry direct
+                try:
+                    if HAS_CURL_CFFI:
+                        direct_session = cffi_requests.Session(impersonate="chrome124")
+                    else:
+                        direct_session = cffi_requests.Session()
+                    resp = direct_session.post(endpoint, json=body, headers=headers, timeout=12)
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        break
+                except Exception:
+                    pass
+
+        if not payload:
+            return None
+
+        return self._parse_quota_payload(payload)
+
+    def refresh_offline_account(self, email: str, refresh_token: str) -> bool:
+        """
+        Refreshes a specific offline account via Google API and updates AccountManager.
+        """
+        items = self.fetch_quota_via_refresh_token(refresh_token)
+        if items:
+            from core.account_manager import get_account_manager
+            acc_mgr = get_account_manager()
+            acc_mgr.update_quota_from_api_items(email=email, items=items)
+            logger.info(f"Successfully refreshed real API quota for offline account: {email}")
+            return True
+        return False
+
