@@ -1,11 +1,12 @@
 """
 Gemini Quota Monitor - Modern Flyout Window
-Windows 11 Fluent-styled card popup displaying Gemini 5-hour rolling quota, weekly quota, reset timers, and Remaining/Used switcher.
+Windows 11 Fluent-styled card popup displaying Gemini 5-hour rolling quota, weekly quota, reset timers,
+and a Multi-Account Quota Tracking Dashboard.
 """
 
 from datetime import datetime
 from typing import Callable, Optional
-from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QFrame,
@@ -15,11 +16,13 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from config import ConfigManager
+from core.account_manager import AccountManager, AccountQuotaRecord, get_account_manager
 from core.models import QuotaItem, QuotaSnapshot
 from utils.win_api import apply_dwm_window_attributes, get_taskbar_info
 
@@ -113,8 +116,245 @@ class QuotaCardWidget(QFrame):
         layout.addLayout(footer_layout)
 
 
+class AccountPoolCardWidget(QFrame):
+    """Card widget rendering a saved account record with 5H & 7D quota recovery stats."""
+
+    def __init__(
+        self,
+        record: AccountQuotaRecord,
+        on_delete: Optional[Callable[[str], None]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.record = record
+        self.on_delete = on_delete
+        self._init_ui()
+
+    def _init_ui(self):
+        level = self.record.recommendation_level
+        if self.record.is_active:
+            bg_color = "#172554"
+            border_color = "#3B82F6"
+        elif level == "ready":
+            bg_color = "#064E3B"
+            border_color = "#10B981"
+        else:
+            bg_color = "#1E293B"
+            border_color = "#334155"
+
+        self.setStyleSheet(f"""
+            QFrame#AccountCard {{
+                background-color: {bg_color};
+                border: 1.5px solid {border_color};
+                border-radius: 12px;
+            }}
+        """)
+        self.setObjectName("AccountCard")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        # 1. Header Row: Badge, Email, Name/Plan, Copy Button, Delete Button
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+
+        # Badge
+        badge = QLabel()
+        if self.record.is_active:
+            badge.setText("🟢 当前在线")
+            badge.setStyleSheet("background-color: #2563EB; color: #FFFFFF; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px;")
+        elif level == "ready":
+            badge.setText("✨ 满血恢复 (建议切换)")
+            badge.setStyleSheet("background-color: #059669; color: #FFFFFF; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px;")
+        elif level == "available":
+            badge.setText("⚡ 额度充裕")
+            badge.setStyleSheet("background-color: #0284C7; color: #FFFFFF; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px;")
+        else:
+            badge.setText("⏳ 冷却中")
+            badge.setStyleSheet("background-color: #334155; color: #94A3B8; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px;")
+        header_row.addWidget(badge)
+
+        # Email
+        email_lbl = QLabel(self.record.email)
+        email_lbl.setToolTip(self.record.email)
+        email_lbl.setStyleSheet("color: #F8FAFC; font-weight: 700; font-size: 13px;")
+        header_row.addWidget(email_lbl)
+
+        # Extra info (Name or Tier)
+        info_parts = []
+        if self.record.name:
+            info_parts.append(self.record.name)
+        if self.record.plan_name:
+            info_parts.append(self.record.plan_name)
+        if info_parts:
+            info_lbl = QLabel(f"({' · '.join(info_parts)})")
+            info_lbl.setStyleSheet("color: #94A3B8; font-size: 11px;")
+            header_row.addWidget(info_lbl)
+
+        header_row.addStretch()
+
+        # Copy Email Button
+        self.btn_copy = QPushButton("📋 复制")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #F1F5F9;
+                border: 1px solid #475569;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+                color: #FFFFFF;
+            }
+        """)
+        self.btn_copy.clicked.connect(self._copy_email)
+        header_row.addWidget(self.btn_copy)
+
+        # Delete Button (only if not active)
+        if not self.record.is_active and self.on_delete:
+            btn_del = QPushButton("🗑️")
+            btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_del.setToolTip("删除该账号记录")
+            btn_del.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    color: #EF4444;
+                    border: 1px solid #7F1D1D;
+                    border-radius: 6px;
+                    padding: 3px 6px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #7F1D1D;
+                    color: #FFFFFF;
+                }
+            """)
+            btn_del.clicked.connect(lambda: self.on_delete(self.record.email))
+            header_row.addWidget(btn_del)
+
+        layout.addLayout(header_row)
+
+        # 2. 5-Hour Quota Row
+        st_5h = self.record.get_5h_status()
+        h5_row = QHBoxLayout()
+        h5_row.setContentsMargins(0, 2, 0, 0)
+        h5_row.setSpacing(8)
+
+        lbl_5h_title = QLabel("5H 额度:")
+        lbl_5h_title.setStyleSheet("color: #CBD5E1; font-size: 12px; font-weight: 600; min-width: 52px;")
+        h5_row.addWidget(lbl_5h_title)
+
+        bar_5h = QProgressBar()
+        bar_5h.setRange(0, 100)
+        val_5h = int(min(100.0, max(0.0, st_5h["percentage"])))
+        bar_5h.setValue(val_5h)
+        bar_5h.setTextVisible(False)
+        bar_5h.setFixedHeight(6)
+
+        color_5h = "#10B981" if val_5h >= 75 else ("#F59E0B" if val_5h >= 30 else "#EF4444")
+        bar_5h.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: #334155;
+                border-radius: 3px;
+                border: none;
+            }}
+            QProgressBar::chunk {{
+                background-color: {color_5h};
+                border-radius: 3px;
+            }}
+        """)
+        h5_row.addWidget(bar_5h, 1)
+
+        val_5h_lbl = QLabel(st_5h["text"])
+        val_5h_lbl.setStyleSheet(f"color: {color_5h}; font-size: 12px; font-weight: 700; min-width: 140px;")
+        val_5h_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h5_row.addWidget(val_5h_lbl)
+
+        layout.addLayout(h5_row)
+
+        # 3. Weekly Quota Row
+        st_wk = self.record.get_weekly_status()
+        wk_row = QHBoxLayout()
+        wk_row.setContentsMargins(0, 0, 0, 0)
+        wk_row.setSpacing(8)
+
+        lbl_wk_title = QLabel("周 额度:")
+        lbl_wk_title.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 600; min-width: 52px;")
+        wk_row.addWidget(lbl_wk_title)
+
+        bar_wk = QProgressBar()
+        bar_wk.setRange(0, 100)
+        val_wk = int(min(100.0, max(0.0, st_wk["percentage"])))
+        bar_wk.setValue(val_wk)
+        bar_wk.setTextVisible(False)
+        bar_wk.setFixedHeight(6)
+
+        color_wk = "#3B82F6" if val_wk >= 30 else "#EF4444"
+        bar_wk.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: #334155;
+                border-radius: 3px;
+                border: none;
+            }}
+            QProgressBar::chunk {{
+                background-color: {color_wk};
+                border-radius: 3px;
+            }}
+        """)
+        wk_row.addWidget(bar_wk, 1)
+
+        val_wk_lbl = QLabel(st_wk["text"])
+        val_wk_lbl.setStyleSheet(f"color: {color_wk}; font-size: 12px; font-weight: 600; min-width: 140px;")
+        val_wk_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        wk_row.addWidget(val_wk_lbl)
+
+        layout.addLayout(wk_row)
+
+    def _copy_email(self):
+        cb = QGuiApplication.clipboard()
+        if cb:
+            cb.setText(self.record.email)
+        self.btn_copy.setText("✅ 已复制!")
+        self.btn_copy.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #FFFFFF;
+                border: 1px solid #10B981;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+        """)
+        QTimer.singleShot(1500, self._reset_copy_btn)
+
+    def _reset_copy_btn(self):
+        self.btn_copy.setText("📋 复制")
+        self.btn_copy.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #F1F5F9;
+                border: 1px solid #475569;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+                color: #FFFFFF;
+            }
+        """)
+
+
 class FlyoutWindow(QWidget):
-    """Modern popup panel positioned next to the Windows system tray with Mode switcher."""
+    """Modern popup panel positioned next to the Windows system tray with Multi-Account Dashboard."""
 
     refresh_requested = pyqtSignal()
     settings_requested = pyqtSignal()
@@ -123,7 +363,9 @@ class FlyoutWindow(QWidget):
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
         self.config_manager = config_manager
+        self.account_manager = get_account_manager()
         self.current_snapshot: Optional[QuotaSnapshot] = None
+        self.current_tab = "current"  # "current" or "accounts"
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -133,10 +375,25 @@ class FlyoutWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self._init_ui()
+        self._init_countdown_timer()
         apply_dwm_window_attributes(int(self.winId()), dark_mode=True, round_corners=True)
 
+    def _init_countdown_timer(self):
+        self._timer = QTimer(self)
+        self._timer.setInterval(15000)  # Refresh every 15s when visible
+        self._timer.timeout.connect(self._on_timer_tick)
+        self._timer.start()
+
+    def _on_timer_tick(self):
+        if not self.isVisible():
+            return
+        if self.current_tab == "accounts":
+            self._render_accounts_tab()
+        elif self.current_snapshot:
+            self._render_current_tab(self.current_snapshot)
+
     def _init_ui(self):
-        self.setFixedWidth(460)
+        self.setFixedWidth(480)
 
         self.main_frame = QFrame(self)
         self.main_frame.setObjectName("MainFrame")
@@ -184,7 +441,34 @@ class FlyoutWindow(QWidget):
 
         content_layout.addLayout(header)
 
-        # 2. Account info & Segmented Switcher Row
+        # 2. Tab Navigation Bar: [ 📊 当前额度 ]  [ 👥 账号看板 ]
+        tab_nav_bar = QHBoxLayout()
+        tab_nav_bar.setContentsMargins(0, 0, 0, 0)
+        tab_nav_bar.setSpacing(8)
+
+        self.btn_tab_current = QPushButton("📊 当前额度")
+        self.btn_tab_current.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_current.clicked.connect(lambda: self.show_tab("current"))
+        tab_nav_bar.addWidget(self.btn_tab_current)
+
+        self.btn_tab_accounts = QPushButton("👥 账号看板")
+        self.btn_tab_accounts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tab_accounts.clicked.connect(lambda: self.show_tab("accounts"))
+        tab_nav_bar.addWidget(self.btn_tab_accounts)
+
+        tab_nav_bar.addStretch()
+        content_layout.addLayout(tab_nav_bar)
+
+        # 3. Stacked Pages Widget
+        self.stacked_widget = QStackedWidget()
+
+        # --- PAGE 0: CURRENT QUOTA PAGE ---
+        page_current = QWidget()
+        page_current_layout = QVBoxLayout(page_current)
+        page_current_layout.setContentsMargins(0, 0, 0, 0)
+        page_current_layout.setSpacing(10)
+
+        # Account info & Segmented Switcher Row
         mid_row = QHBoxLayout()
         mid_row.setContentsMargins(0, 0, 0, 0)
         mid_row.setSpacing(8)
@@ -221,10 +505,9 @@ class FlyoutWindow(QWidget):
         pill_layout.addWidget(self.btn_mode_used)
         mid_row.addWidget(mode_pill)
 
-        content_layout.addLayout(mid_row)
-        self._update_mode_buttons_ui()
+        page_current_layout.addLayout(mid_row)
 
-        # 3. Cards Area (Scrollable without horizontal scrollbar)
+        # Cards Scroll Area
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -254,7 +537,79 @@ class FlyoutWindow(QWidget):
         self.cards_layout.setSpacing(10)
 
         self.scroll_area.setWidget(self.cards_container)
-        content_layout.addWidget(self.scroll_area)
+        page_current_layout.addWidget(self.scroll_area)
+        self.stacked_widget.addWidget(page_current)
+
+        # --- PAGE 1: ACCOUNTS POOL DASHBOARD PAGE ---
+        page_accounts = QWidget()
+        page_accounts_layout = QVBoxLayout(page_accounts)
+        page_accounts_layout.setContentsMargins(0, 0, 0, 0)
+        page_accounts_layout.setSpacing(10)
+
+        acc_header_row = QHBoxLayout()
+        acc_header_row.setContentsMargins(0, 0, 0, 0)
+        acc_header_row.setSpacing(8)
+
+        self.acc_summary_lbl = QLabel("多账号轮转管理 (切换 IDE 账号后自动登记)")
+        self.acc_summary_lbl.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        acc_header_row.addWidget(self.acc_summary_lbl)
+        acc_header_row.addStretch()
+
+        btn_acc_refresh = QPushButton("🔄 刷新推算")
+        btn_acc_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_acc_refresh.setStyleSheet("""
+            QPushButton {
+                background-color: #1E293B;
+                color: #CBD5E1;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #F8FAFC;
+            }
+        """)
+        btn_acc_refresh.clicked.connect(self._render_accounts_tab)
+        acc_header_row.addWidget(btn_acc_refresh)
+
+        page_accounts_layout.addLayout(acc_header_row)
+
+        self.acc_scroll_area = QScrollArea()
+        self.acc_scroll_area.setWidgetResizable(True)
+        self.acc_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.acc_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.acc_scroll_area.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #0F172A;
+                width: 6px;
+                margin: 0;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background: #334155;
+                min-height: 20px;
+                border-radius: 3px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """)
+
+        self.acc_cards_container = QWidget()
+        self.acc_cards_container.setStyleSheet("background: transparent;")
+        self.acc_cards_layout = QVBoxLayout(self.acc_cards_container)
+        self.acc_cards_layout.setContentsMargins(0, 4, 4, 4)
+        self.acc_cards_layout.setSpacing(10)
+
+        self.acc_scroll_area.setWidget(self.acc_cards_container)
+        page_accounts_layout.addWidget(self.acc_scroll_area)
+        self.stacked_widget.addWidget(page_accounts)
+
+        content_layout.addWidget(self.stacked_widget)
 
         # 4. Action Buttons Footer Row
         footer = QHBoxLayout()
@@ -326,6 +681,62 @@ class FlyoutWindow(QWidget):
 
         content_layout.addLayout(footer)
 
+        self._update_tab_buttons_ui()
+        self._update_mode_buttons_ui()
+
+    def show_tab(self, tab_name: str):
+        """Switches between 'current' and 'accounts' tabs."""
+        self.current_tab = tab_name
+        self._update_tab_buttons_ui()
+
+        if tab_name == "accounts":
+            self.stacked_widget.setCurrentIndex(1)
+            self._render_accounts_tab()
+        else:
+            self.stacked_widget.setCurrentIndex(0)
+            if self.current_snapshot:
+                self._render_current_tab(self.current_snapshot)
+
+    def _update_tab_buttons_ui(self):
+        ready = self.account_manager.get_ready_count()
+        if ready > 0:
+            self.btn_tab_accounts.setText(f"👥 账号看板 ({ready}个满血 ✨)")
+        else:
+            self.btn_tab_accounts.setText("👥 账号看板")
+
+        active_style = """
+            QPushButton {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 8px;
+                padding: 6px 14px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+        """
+        inactive_style = """
+            QPushButton {
+                background-color: #1E293B;
+                color: #94A3B8;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 6px 14px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #F8FAFC;
+            }
+        """
+        if self.current_tab == "accounts":
+            self.btn_tab_accounts.setStyleSheet(active_style)
+            self.btn_tab_current.setStyleSheet(inactive_style)
+        else:
+            self.btn_tab_current.setStyleSheet(active_style)
+            self.btn_tab_accounts.setStyleSheet(inactive_style)
+
     def _set_display_mode(self, mode: str):
         if self.config_manager.config.display.usage_display_mode != mode:
             self.config_manager.config.display.usage_display_mode = mode
@@ -372,13 +783,16 @@ class FlyoutWindow(QWidget):
     def update_snapshot(self, snapshot: QuotaSnapshot):
         self.current_snapshot = snapshot
         self._update_mode_buttons_ui()
+        self._update_tab_buttons_ui()
 
         now_str = datetime.now().strftime("%H:%M:%S")
         self.time_lbl.setText(f"{now_str} 同步")
 
         email = snapshot.account_label or self.config_manager.config.gemini.account_email or "未关联账号"
+        name_str = f" ({snapshot.user_name})" if snapshot.user_name else ""
+        plan_str = f" [{snapshot.plan_name}]" if snapshot.plan_name else ""
         proj = f" (项目: {snapshot.project_id})" if snapshot.project_id else ""
-        self.account_lbl.setText(f"账号: {email}{proj}")
+        self.account_lbl.setText(f"账号: {email}{name_str}{plan_str}{proj}")
 
         if snapshot.is_healthy:
             self.source_badge.setText(snapshot.source_name)
@@ -401,6 +815,12 @@ class FlyoutWindow(QWidget):
                 border-radius: 6px;
             """)
 
+        if self.current_tab == "current":
+            self._render_current_tab(snapshot)
+        else:
+            self._render_accounts_tab()
+
+    def _render_current_tab(self, snapshot: QuotaSnapshot):
         # Clear existing cards
         while self.cards_layout.count():
             child = self.cards_layout.takeAt(0)
@@ -434,10 +854,62 @@ class FlyoutWindow(QWidget):
 
         self.cards_layout.addStretch()
 
-        # Dynamic height calculation
         num_cards = len(snapshot.items) if snapshot.is_healthy and snapshot.items else 1
-        calculated_h = min(600, max(260, 140 + num_cards * 110))
+        calculated_h = min(620, max(280, 160 + num_cards * 115))
         self.resize(self.width(), calculated_h)
+
+    def _render_accounts_tab(self):
+        self.account_manager.load()
+        accounts = self.account_manager.list_accounts()
+        ready_count = self.account_manager.get_ready_count()
+        self._update_tab_buttons_ui()
+
+        if accounts:
+            self.acc_summary_lbl.setText(
+                f"已记录 {len(accounts)} 个账号 · {ready_count} 个满血恢复就绪 ✨" if ready_count > 0 else f"已记录 {len(accounts)} 个账号"
+            )
+        else:
+            self.acc_summary_lbl.setText("多账号轮转管理 (切换 IDE 账号后自动登记)")
+
+        while self.acc_cards_layout.count():
+            child = self.acc_cards_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        if not accounts:
+            empty_box = QFrame()
+            empty_box.setStyleSheet("background-color: #1E293B; border: 1px dashed #334155; border-radius: 12px; padding: 24px;")
+            empty_lay = QVBoxLayout(empty_box)
+            empty_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            t1 = QLabel("🔍 暂未记录多账号")
+            t1.setStyleSheet("color: #F8FAFC; font-weight: 700; font-size: 14px;")
+            t1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_lay.addWidget(t1)
+
+            t2 = QLabel("在 Antigravity IDE 中切换不同 Google 账号，\n本程序会自动捕获配额与重置时间，并在后台持续推算满血恢复倒计时。")
+            t2.setStyleSheet("color: #94A3B8; font-size: 12px; margin-top: 6px;")
+            t2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_lay.addWidget(t2)
+
+            self.acc_cards_layout.addWidget(empty_box)
+        else:
+            for acc in accounts:
+                card = AccountPoolCardWidget(
+                    record=acc,
+                    on_delete=self._on_delete_account,
+                )
+                self.acc_cards_layout.addWidget(card)
+
+        self.acc_cards_layout.addStretch()
+
+        num_acc = max(1, len(accounts))
+        calculated_h = min(620, max(360, 200 + num_acc * 105))
+        self.resize(self.width(), calculated_h)
+
+    def _on_delete_account(self, email: str):
+        self.account_manager.remove_account(email)
+        self._render_accounts_tab()
 
     def show_near_cursor_or_tray(self, reference_rect: Optional[QRect] = None):
         screen = QGuiApplication.primaryScreen()
@@ -476,8 +948,9 @@ class FlyoutWindow(QWidget):
     def _on_refresh_clicked(self):
         self.btn_refresh.setEnabled(False)
         self.btn_refresh.setText("刷新中...")
+        if self.current_tab == "accounts":
+            self._render_accounts_tab()
         self.refresh_requested.emit()
-        from PyQt6.QtCore import QTimer
         QTimer.singleShot(2000, lambda: (self.btn_refresh.setEnabled(True), self.btn_refresh.setText("🔄 刷新")))
 
     def _on_settings_clicked(self):

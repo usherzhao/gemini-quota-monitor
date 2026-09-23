@@ -101,6 +101,46 @@ def test_ui():
     assert cfg_mgr.config.display.dock_auto_collapse_edge is False
     print("[SmokeTest] Settings load and save verified!")
 
+    # Test Multi-Account Dashboard in Flyout & Dock
+    from core.account_manager import get_account_manager
+    from datetime import datetime, timedelta
+    acc_mgr = get_account_manager()
+    acc_mgr.update_or_add_account(
+        email="active_user@example.com",
+        name="Active Tester",
+        plan_name="Pro",
+        gemini_5h_remaining=45.0,
+        gemini_5h_reset_time=datetime.now() + timedelta(hours=2),
+        is_active=True,
+    )
+    acc_mgr.update_or_add_account(
+        email="recovered_user@example.com",
+        name="Offline Ready",
+        plan_name="Standard",
+        gemini_5h_remaining=10.0,
+        gemini_5h_reset_time=datetime.now() - timedelta(minutes=10),  # expired -> recovered
+        is_active=False,
+    )
+
+    # Switch to accounts tab
+    flyout.show_tab("accounts")
+    assert flyout.current_tab == "accounts"
+    assert "满血" in flyout.btn_tab_accounts.text()
+    print(f"[SmokeTest] Accounts tab rendered with button: {flyout.btn_tab_accounts.text()}")
+
+    # Verify dock tooltip includes multi-account summary
+    dock.update_snapshot(snapshot)
+    assert "满血恢复" in dock.toolTip()
+    print(f"[SmokeTest] Dock tooltip verified: {dock.toolTip()}")
+
+    # Switch back to current tab
+    flyout.show_tab("current")
+    assert flyout.current_tab == "current"
+
+    # Clean up test accounts
+    acc_mgr.remove_account("active_user@example.com")
+    acc_mgr.remove_account("recovered_user@example.com")
+
     dock.close()
     flyout.close()
     settings.close()

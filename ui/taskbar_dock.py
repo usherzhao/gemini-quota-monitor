@@ -89,6 +89,7 @@ class TaskbarDockWidget(QWidget):
     """Semi-transparent floating capsule widget docked onto the Windows Taskbar for Gemini."""
 
     clicked = pyqtSignal()
+    open_accounts_requested = pyqtSignal()
     refresh_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     toggle_mode_requested = pyqtSignal()
@@ -232,6 +233,10 @@ class TaskbarDockWidget(QWidget):
         action_details.triggered.connect(self.clicked.emit)
         self.context_menu.addAction(action_details)
 
+        action_accounts = QAction("👥 账号看板 (多账号管理)...", self)
+        action_accounts.triggered.connect(self.open_accounts_requested.emit)
+        self.context_menu.addAction(action_accounts)
+
         action_refresh = QAction("🔄 立即刷新配额", self)
         action_refresh.triggered.connect(self.refresh_requested.emit)
         self.context_menu.addAction(action_refresh)
@@ -348,8 +353,15 @@ class TaskbarDockWidget(QWidget):
 
         # Update rich tooltip on hover
         try:
+            from core.account_manager import get_account_manager
+            acc_mgr = get_account_manager()
+            ready_cnt = acc_mgr.get_ready_count()
+            total_acc = len(acc_mgr.accounts)
+
             if self.current_snapshot and self.current_snapshot.is_healthy:
                 tip_lines = ["Gemini 配额监控 (左键打开面板 / 右键菜单):"]
+                if self.current_snapshot.account_label:
+                    tip_lines.append(f"当前账号: {self.current_snapshot.account_label}")
                 if self.current_snapshot.item_5h:
                     it = self.current_snapshot.item_5h
                     st = it.get_display_stats(self.config_manager.config.display.usage_display_mode)
@@ -360,6 +372,11 @@ class TaskbarDockWidget(QWidget):
                     st = it.get_display_stats(self.config_manager.config.display.usage_display_mode)
                     cd = it.format_countdown()
                     tip_lines.append(f"  • 周总额度: {st['text']} (重置: {cd})")
+                if total_acc > 1:
+                    if ready_cnt > 0:
+                        tip_lines.append(f"多账号看板: {ready_cnt}个历史账号已满血恢复 ✨ (右键查看)")
+                    else:
+                        tip_lines.append(f"多账号看板: 共记录 {total_acc} 个账号")
                 tip_lines.append(f"更新时间: {self.current_snapshot.timestamp.strftime('%H:%M:%S')}")
                 self.setToolTip("\n".join(tip_lines))
             elif self.current_snapshot and not self.current_snapshot.is_healthy:

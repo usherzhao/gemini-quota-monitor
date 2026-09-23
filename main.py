@@ -63,6 +63,7 @@ class AppController(QObject):
             on_reset_dock=self.reset_dock,
             on_toggle_mode=self.toggle_usage_mode,
             on_exit=self.exit_app,
+            on_open_accounts=self.open_accounts,
         )
 
         self._connect_signals()
@@ -80,6 +81,7 @@ class AppController(QObject):
 
         # Dock actions
         self.dock_widget.clicked.connect(self.toggle_flyout)
+        self.dock_widget.open_accounts_requested.connect(self.open_accounts)
         self.dock_widget.refresh_requested.connect(self.engine.refresh_now)
         self.dock_widget.settings_requested.connect(self.open_settings)
         self.dock_widget.toggle_mode_requested.connect(self.toggle_usage_mode)
@@ -164,7 +166,12 @@ class AppController(QObject):
         if self.flyout_window.isVisible():
             self.flyout_window.hide()
         else:
+            self.flyout_window.show_tab("current")
             self.flyout_window.show_near_cursor_or_tray()
+
+    def open_accounts(self):
+        self.flyout_window.show_tab("accounts")
+        self.flyout_window.show_near_cursor_or_tray()
 
     def open_settings(self):
         self.settings_window.show()

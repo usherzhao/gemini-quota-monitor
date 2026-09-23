@@ -36,6 +36,7 @@ class TrayIconManager:
         on_reset_dock: Callable[[], None],
         on_toggle_mode: Callable[[], None],
         on_exit: Callable[[], None],
+        on_open_accounts: Optional[Callable[[], None]] = None,
     ):
         self.config_manager = config_manager
         self.on_toggle_flyout = on_toggle_flyout
@@ -45,6 +46,7 @@ class TrayIconManager:
         self.on_reset_dock = on_reset_dock
         self.on_toggle_mode = on_toggle_mode
         self.on_exit = on_exit
+        self.on_open_accounts = on_open_accounts
 
         self.tray_icon = QSystemTrayIcon()
         self._init_menu()
@@ -86,6 +88,11 @@ class TrayIconManager:
         self.act_panel = QAction("📊 打开额度详情面板", self.menu)
         self.act_panel.triggered.connect(self.on_toggle_flyout)
         self.menu.addAction(self.act_panel)
+
+        if self.on_open_accounts:
+            self.act_accounts = QAction("👥 账号看板 (多账号管理)...", self.menu)
+            self.act_accounts.triggered.connect(self.on_open_accounts)
+            self.menu.addAction(self.act_accounts)
 
         self.act_mode_toggle = QAction("🔀 切换视角 (剩余量 % ⇄ 已用量 %)", self.menu)
         self.act_mode_toggle.triggered.connect(self.on_toggle_mode)

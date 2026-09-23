@@ -83,13 +83,36 @@ class GeminiQuotaFetcher:
             return None
         return None
 
-    def _fetch_from_antigravity_ls(self) -> Optional[Dict[str, Any]]:
+    def _query_local_user_status(self, port: int, csrf_token: str) -> Optional[Dict[str, Any]]:
+        """Queries local Antigravity Language Server RPC for active user email, name and plan status."""
+        url = f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus"
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Codeium-Csrf-Token": csrf_token,
+                "Connect-Protocol-Version": "1",
+            },
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=1.5) as resp:
+                if resp.getcode() == 200:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                    return json.loads(raw)
+        except Exception:
+            return None
+        return None
+
+    def _fetch_from_antigravity_ls(self) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
         """Automatically discovers running Antigravity IDE and queries its local Language Server."""
         # 1. Try cached connection first (lightning fast, ~20ms)
         if self._cached_ls_port and self._cached_ls_csrf:
             data = self._query_local_ls(self._cached_ls_port, self._cached_ls_csrf)
             if data and ("groups" in data or "response" in data):
-                return data
+                user_data = self._query_local_user_status(self._cached_ls_port, self._cached_ls_csrf)
+                return data, user_data
             self._cached_ls_port = None
             self._cached_ls_csrf = None
 
@@ -114,7 +137,8 @@ class GeminiQuotaFetcher:
                                 if data and ("groups" in data or "response" in data):
                                     self._cached_ls_port = port
                                     self._cached_ls_csrf = csrf_token
-                                    return data
+                                    user_data = self._query_local_user_status(port, csrf_token)
+                                    return data, user_data
                 except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                     continue
         except Exception as e:
@@ -232,14 +256,58 @@ class GeminiQuotaFetcher:
         # Priority 1: Direct Live Link to local Antigravity IDE
         # If Antigravity IDE is running, this gives the exact 100% synchronized live quota & countdowns with zero proxy/latency.
         try:
-            local_payload = self._fetch_from_antigravity_ls()
-            if local_payload:
-                items = self._parse_quota_payload(local_payload)
+            ls_result = self._fetch_from_antigravity_ls()
+            if ls_result:
+                quota_payload, user_payload = ls_result
+                items = self._parse_quota_payload(quota_payload)
                 if items:
-                    logger.info(f"Successfully fetched {len(items)} live quota items directly from local Antigravity IDE")
+                    user_email = ""
+                    user_name = ""
+                    plan_name = ""
+                    if user_payload and isinstance(user_payload, dict) and "userStatus" in user_payload:
+                        us = user_payload.get("userStatus", {})
+                        user_email = str(us.get("email") or "").strip()
+                        user_name = str(us.get("name") or "").strip()
+                        plan_info = us.get("userTier") or us.get("planStatus", {}).get("planInfo", {})
+                        if isinstance(plan_info, dict):
+                            plan_name = str(plan_info.get("name") or plan_info.get("planName") or "").strip()
+
+                    active_email = user_email or account_email or "Antigravity Active User"
+
+                    # Automatically update multi-account manager
+                    if user_email:
+                        try:
+                            from core.account_manager import get_account_manager
+                            acc_mgr = get_account_manager()
+
+                            item_5h = next((it for it in items if "5h" in it.id.lower()), None)
+                            item_week = next((it for it in items if "weekly" in it.id.lower() or "week" in it.id.lower()), None)
+                            item_c5h = next((it for it in items if "claude" in it.id.lower() and "5h" in it.id.lower()), None)
+                            item_cweek = next((it for it in items if "claude" in it.id.lower() and "week" in it.id.lower()), None)
+
+                            acc_mgr.update_or_add_account(
+                                email=user_email,
+                                name=user_name,
+                                plan_name=plan_name,
+                                gemini_5h_remaining=item_5h.remaining if item_5h else 100.0,
+                                gemini_5h_reset_time=item_5h.reset_time if item_5h else None,
+                                gemini_weekly_remaining=item_week.remaining if item_week else 100.0,
+                                gemini_weekly_reset_time=item_week.reset_time if item_week else None,
+                                claude_5h_remaining=item_c5h.remaining if item_c5h else 100.0,
+                                claude_5h_reset_time=item_c5h.reset_time if item_c5h else None,
+                                claude_weekly_remaining=item_cweek.remaining if item_cweek else 100.0,
+                                claude_weekly_reset_time=item_cweek.reset_time if item_cweek else None,
+                                is_active=True,
+                            )
+                        except Exception as acc_err:
+                            logger.debug(f"AccountManager update error: {acc_err}")
+
+                    logger.info(f"Successfully fetched {len(items)} live quota items directly from local Antigravity IDE (User: {active_email})")
                     return QuotaSnapshot(
                         source_name="Google Gemini (Antigravity)",
-                        account_label=account_email or "Antigravity Active User",
+                        account_label=active_email,
+                        user_name=user_name,
+                        plan_name=plan_name,
                         project_id="Antigravity Live",
                         items=items,
                         status="ok",

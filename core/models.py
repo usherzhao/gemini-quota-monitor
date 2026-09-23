@@ -144,6 +144,8 @@ class QuotaSnapshot:
     source_name: str
     account_label: str
     project_id: str = ""
+    user_name: str = ""
+    plan_name: str = ""
     items: List[QuotaItem] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.now)
     status: str = "ok"
