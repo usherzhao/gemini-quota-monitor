@@ -166,7 +166,7 @@ class AccountPoolCardWidget(QFrame):
             badge.setText("🟢 当前在线")
             badge.setStyleSheet("background-color: #2563EB; color: #FFFFFF; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px;")
         elif level == "ready":
-            badge.setText("✨ 满血恢复 (建议切换)")
+            badge.setText("✨ 建议切换")
             badge.setStyleSheet("background-color: #059669; color: #FFFFFF; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px;")
         elif level == "available":
             badge.setText("⚡ 额度充裕")
@@ -247,7 +247,7 @@ class AccountPoolCardWidget(QFrame):
         h5_row.setSpacing(8)
 
         lbl_5h_title = QLabel("5H 额度:")
-        lbl_5h_title.setStyleSheet("color: #CBD5E1; font-size: 12px; font-weight: 600; min-width: 52px;")
+        lbl_5h_title.setStyleSheet("color: #CBD5E1; font-size: 12px; font-weight: 600;")
         h5_row.addWidget(lbl_5h_title)
 
         bar_5h = QProgressBar()
@@ -272,7 +272,7 @@ class AccountPoolCardWidget(QFrame):
         h5_row.addWidget(bar_5h, 1)
 
         val_5h_lbl = QLabel(st_5h["text"])
-        val_5h_lbl.setStyleSheet(f"color: {color_5h}; font-size: 12px; font-weight: 700; min-width: 140px;")
+        val_5h_lbl.setStyleSheet(f"color: {color_5h}; font-size: 12px; font-weight: 700;")
         val_5h_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         h5_row.addWidget(val_5h_lbl)
 
@@ -285,7 +285,7 @@ class AccountPoolCardWidget(QFrame):
         wk_row.setSpacing(8)
 
         lbl_wk_title = QLabel("周 额度:")
-        lbl_wk_title.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 600; min-width: 52px;")
+        lbl_wk_title.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 600;")
         wk_row.addWidget(lbl_wk_title)
 
         bar_wk = QProgressBar()
@@ -310,7 +310,7 @@ class AccountPoolCardWidget(QFrame):
         wk_row.addWidget(bar_wk, 1)
 
         val_wk_lbl = QLabel(st_wk["text"])
-        val_wk_lbl.setStyleSheet(f"color: {color_wk}; font-size: 12px; font-weight: 600; min-width: 140px;")
+        val_wk_lbl.setStyleSheet(f"color: {color_wk}; font-size: 12px; font-weight: 600;")
         val_wk_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         wk_row.addWidget(val_wk_lbl)
 
@@ -393,7 +393,7 @@ class FlyoutWindow(QWidget):
             self._render_current_tab(self.current_snapshot)
 
     def _init_ui(self):
-        self.setFixedWidth(480)
+        self.setFixedWidth(620)
 
         self.main_frame = QFrame(self)
         self.main_frame.setObjectName("MainFrame")
@@ -855,7 +855,7 @@ class FlyoutWindow(QWidget):
         self.cards_layout.addStretch()
 
         num_cards = len(snapshot.items) if snapshot.is_healthy and snapshot.items else 1
-        calculated_h = min(620, max(280, 160 + num_cards * 115))
+        calculated_h = min(680, max(360, 240 + num_cards * 140))
         self.resize(self.width(), calculated_h)
 
     def _render_accounts_tab(self):
@@ -904,7 +904,7 @@ class FlyoutWindow(QWidget):
         self.acc_cards_layout.addStretch()
 
         num_acc = max(1, len(accounts))
-        calculated_h = min(620, max(360, 200 + num_acc * 105))
+        calculated_h = min(680, max(360, 200 + num_acc * 115))
         self.resize(self.width(), calculated_h)
 
     def _on_delete_account(self, email: str):
