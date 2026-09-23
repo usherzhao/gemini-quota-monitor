@@ -2,12 +2,22 @@
 Gemini Quota Monitor - Modern Flyout Window
 Windows 11 Fluent-styled card popup displaying Gemini 5-hour rolling quota, weekly quota, reset timers,
 and a Multi-Account Quota Tracking Dashboard.
+Equipped with draggable window mobility and tight auto-fitting responsive layouts.
 """
 
 from datetime import datetime
 from typing import Callable, Optional
 from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -27,6 +37,32 @@ from core.models import QuotaItem, QuotaSnapshot
 from utils.win_api import apply_dwm_window_attributes, get_taskbar_info
 
 
+class ResizableStackedWidget(QStackedWidget):
+    """QStackedWidget that reports sizeHint based strictly on the current active page."""
+
+    def sizeHint(self):
+        cur = self.currentWidget()
+        if cur:
+            return cur.sizeHint()
+        return super().sizeHint()
+
+    def minimumSizeHint(self):
+        cur = self.currentWidget()
+        if cur:
+            return cur.minimumSizeHint()
+        return super().minimumSizeHint()
+
+    def setCurrentIndex(self, index: int):
+        prev = self.currentWidget()
+        super().setCurrentIndex(index)
+        now = self.currentWidget()
+        if prev and prev != now:
+            prev.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        if now:
+            now.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.updateGeometry()
+
+
 class QuotaCardWidget(QFrame):
     """Card widget rendering a single quota metric (e.g., 5-Hour or Weekly)."""
 
@@ -38,17 +74,17 @@ class QuotaCardWidget(QFrame):
 
     def _init_ui(self):
         self.setStyleSheet("""
-            QFrame {
+            QFrame#QuotaCard {
                 background-color: #1E293B;
                 border: 1px solid #334155;
                 border-radius: 12px;
-                padding: 12px;
             }
         """)
+        self.setObjectName("QuotaCard")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
 
         stats = self.item.get_display_stats(self.display_mode)
 
@@ -101,7 +137,7 @@ class QuotaCardWidget(QFrame):
         # 3. Footer Row: Reset Countdown & Description
         footer_layout = QVBoxLayout()
         footer_layout.setContentsMargins(0, 0, 0, 0)
-        footer_layout.setSpacing(4)
+        footer_layout.setSpacing(2)
 
         if self.item.reset_time or self.item.reset_text:
             timer_lbl = QLabel(f"⏱ 重置倒计时: {self.item.format_countdown()}")
@@ -152,8 +188,8 @@ class AccountPoolCardWidget(QFrame):
         self.setObjectName("AccountCard")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
 
         # 1. Header Row: Badge, Email, Name/Plan, Copy Button, Delete Button
         header_row = QHBoxLayout()
@@ -354,7 +390,7 @@ class AccountPoolCardWidget(QFrame):
 
 
 class FlyoutWindow(QWidget):
-    """Modern popup panel positioned next to the Windows system tray with Multi-Account Dashboard."""
+    """Modern popup panel positioned next to the Windows system tray with Multi-Account Dashboard and Drag support."""
 
     refresh_requested = pyqtSignal()
     settings_requested = pyqtSignal()
@@ -366,6 +402,12 @@ class FlyoutWindow(QWidget):
         self.account_manager = get_account_manager()
         self.current_snapshot: Optional[QuotaSnapshot] = None
         self.current_tab = "current"  # "current" or "accounts"
+
+        # Dragging state
+        self._dragging = False
+        self._drag_start_pos = QPoint()
+        self._user_dragged = False
+        self._custom_pos: Optional[QPoint] = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -410,17 +452,24 @@ class FlyoutWindow(QWidget):
         outer_layout.addWidget(self.main_frame)
 
         content_layout = QVBoxLayout(self.main_frame)
-        content_layout.setContentsMargins(18, 18, 18, 16)
-        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(18, 16, 18, 14)
+        content_layout.setSpacing(10)
 
-        # 1. Header Row
+        # 1. Header Row (Draggable title bar)
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
 
         app_title = QLabel("⚡ Gemini 用量监控")
         app_title.setStyleSheet("color: #F8FAFC; font-size: 16px; font-weight: 700;")
+        app_title.setToolTip("按住可鼠标拖拽移动窗口位置；双击顶栏贴齐任务栏")
         header.addWidget(app_title)
+
+        drag_hint = QLabel("⋮⋮")
+        drag_hint.setToolTip("按住可鼠标拖拽移动窗口位置；双击顶栏贴齐任务栏")
+        drag_hint.setStyleSheet("color: #475569; font-size: 14px; font-weight: bold; padding-left: 2px;")
+        drag_hint.setCursor(Qt.CursorShape.SizeAllCursor)
+        header.addWidget(drag_hint)
 
         self.source_badge = QLabel("载入中...")
         self.source_badge.setStyleSheet("""
@@ -459,14 +508,14 @@ class FlyoutWindow(QWidget):
         tab_nav_bar.addStretch()
         content_layout.addLayout(tab_nav_bar)
 
-        # 3. Stacked Pages Widget
-        self.stacked_widget = QStackedWidget()
+        # 3. Dynamic Stacked Pages Widget (Auto-resizes strictly to active page)
+        self.stacked_widget = ResizableStackedWidget()
 
         # --- PAGE 0: CURRENT QUOTA PAGE ---
         page_current = QWidget()
         page_current_layout = QVBoxLayout(page_current)
         page_current_layout.setContentsMargins(0, 0, 0, 0)
-        page_current_layout.setSpacing(10)
+        page_current_layout.setSpacing(8)
 
         # Account info & Segmented Switcher Row
         mid_row = QHBoxLayout()
@@ -512,6 +561,7 @@ class FlyoutWindow(QWidget):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.scroll_area.setStyleSheet("""
             QScrollArea { background: transparent; border: none; }
             QScrollBar:vertical {
@@ -533,8 +583,8 @@ class FlyoutWindow(QWidget):
         self.cards_container = QWidget()
         self.cards_container.setStyleSheet("background: transparent;")
         self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(0, 4, 4, 4)
-        self.cards_layout.setSpacing(10)
+        self.cards_layout.setContentsMargins(0, 2, 2, 2)
+        self.cards_layout.setSpacing(8)
 
         self.scroll_area.setWidget(self.cards_container)
         page_current_layout.addWidget(self.scroll_area)
@@ -544,7 +594,7 @@ class FlyoutWindow(QWidget):
         page_accounts = QWidget()
         page_accounts_layout = QVBoxLayout(page_accounts)
         page_accounts_layout.setContentsMargins(0, 0, 0, 0)
-        page_accounts_layout.setSpacing(10)
+        page_accounts_layout.setSpacing(8)
 
         acc_header_row = QHBoxLayout()
         acc_header_row.setContentsMargins(0, 0, 0, 0)
@@ -581,6 +631,7 @@ class FlyoutWindow(QWidget):
         self.acc_scroll_area.setWidgetResizable(True)
         self.acc_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.acc_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.acc_scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.acc_scroll_area.setStyleSheet("""
             QScrollArea { background: transparent; border: none; }
             QScrollBar:vertical {
@@ -602,8 +653,8 @@ class FlyoutWindow(QWidget):
         self.acc_cards_container = QWidget()
         self.acc_cards_container.setStyleSheet("background: transparent;")
         self.acc_cards_layout = QVBoxLayout(self.acc_cards_container)
-        self.acc_cards_layout.setContentsMargins(0, 4, 4, 4)
-        self.acc_cards_layout.setSpacing(10)
+        self.acc_cards_layout.setContentsMargins(0, 2, 2, 2)
+        self.acc_cards_layout.setSpacing(8)
 
         self.acc_scroll_area.setWidget(self.acc_cards_container)
         page_accounts_layout.addWidget(self.acc_scroll_area)
@@ -613,7 +664,7 @@ class FlyoutWindow(QWidget):
 
         # 4. Action Buttons Footer Row
         footer = QHBoxLayout()
-        footer.setContentsMargins(0, 4, 0, 0)
+        footer.setContentsMargins(0, 2, 0, 0)
         footer.setSpacing(8)
 
         btn_settings = QPushButton("⚙️ 设置与登录")
@@ -683,6 +734,52 @@ class FlyoutWindow(QWidget):
 
         self._update_tab_buttons_ui()
         self._update_mode_buttons_ui()
+
+    # =========================================================================
+    # Mouse Dragging Support
+    # =========================================================================
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_start_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+            self._user_dragged = True
+            new_pos = event.globalPosition().toPoint() - self._drag_start_pos
+            self._custom_pos = new_pos
+            self.move(new_pos)
+            event.accept()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            event.accept()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Double click resets position back to taskbar tray dock
+            self._user_dragged = False
+            self._custom_pos = None
+            self.reposition_near_tray()
+            event.accept()
+        super().mouseDoubleClickEvent(event)
+
+    def _adjust_window_height(self, target_h: int):
+        target_h = max(240, min(680, target_h))
+        old_h = self.height()
+        old_bottom = self.y() + old_h
+        self.resize(self.width(), target_h)
+
+        # If anchored near taskbar, keep bottom aligned above taskbar
+        if not self._user_dragged:
+            new_y = old_bottom - target_h
+            self.move(self.x(), new_y)
+        self.updateGeometry()
 
     def show_tab(self, tab_name: str):
         """Switches between 'current' and 'accounts' tabs."""
@@ -841,22 +938,25 @@ class FlyoutWindow(QWidget):
             err_lay.addWidget(err_msg)
 
             self.cards_layout.addWidget(err_box)
+            cards_h = 110
         elif not snapshot.items:
             empty_lbl = QLabel("暂未检测到配额信息，请确保已登录并具有 Code Assist 访问权限。")
             empty_lbl.setStyleSheet("color: #94A3B8; padding: 20px; font-size: 13px;")
             empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.cards_layout.addWidget(empty_lbl)
+            cards_h = 100
         else:
             mode = self.config_manager.config.display.usage_display_mode
             for item in snapshot.items:
                 card = QuotaCardWidget(item, display_mode=mode)
                 self.cards_layout.addWidget(card)
 
-        self.cards_layout.addStretch()
+            num_cards = len(snapshot.items)
+            cards_h = num_cards * 85 + max(0, num_cards - 1) * 8
 
-        num_cards = len(snapshot.items) if snapshot.is_healthy and snapshot.items else 1
-        calculated_h = min(680, max(360, 240 + num_cards * 140))
-        self.resize(self.width(), calculated_h)
+        self.scroll_area.setFixedHeight(min(360, max(90, cards_h)))
+        target_h = 205 + min(360, max(90, cards_h))
+        self._adjust_window_height(target_h)
 
     def _render_accounts_tab(self):
         self.account_manager.load()
@@ -893,6 +993,7 @@ class FlyoutWindow(QWidget):
             empty_lay.addWidget(t2)
 
             self.acc_cards_layout.addWidget(empty_box)
+            cards_h = 105
         else:
             for acc in accounts:
                 card = AccountPoolCardWidget(
@@ -901,20 +1002,36 @@ class FlyoutWindow(QWidget):
                 )
                 self.acc_cards_layout.addWidget(card)
 
-        self.acc_cards_layout.addStretch()
+            num_acc = len(accounts)
+            cards_h = num_acc * 85 + max(0, num_acc - 1) * 8
 
-        num_acc = max(1, len(accounts))
-        calculated_h = min(680, max(360, 200 + num_acc * 115))
-        self.resize(self.width(), calculated_h)
+        self.acc_scroll_area.setFixedHeight(min(360, max(90, cards_h)))
+        target_h = 205 + min(360, max(90, cards_h))
+        self._adjust_window_height(target_h)
 
     def _on_delete_account(self, email: str):
         self.account_manager.remove_account(email)
         self._render_accounts_tab()
 
     def show_near_cursor_or_tray(self, reference_rect: Optional[QRect] = None):
+        # If user has dragged the window to a custom location, keep it there
+        if self._user_dragged and self._custom_pos:
+            screen = QGuiApplication.screenAt(self._custom_pos)
+            if screen:
+                self.move(self._custom_pos)
+                self.show()
+                self.raise_()
+                self.activateWindow()
+                return
+
+        self.reposition_near_tray()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def reposition_near_tray(self):
         screen = QGuiApplication.primaryScreen()
         if not screen:
-            self.show()
             return
 
         avail = screen.availableGeometry()
@@ -936,9 +1053,6 @@ class FlyoutWindow(QWidget):
                 x = tb_info.rect.right + 10
 
         self.move(x, y)
-        self.show()
-        self.raise_()
-        self.activateWindow()
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
