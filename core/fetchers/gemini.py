@@ -12,6 +12,11 @@ import urllib.request
 from config import ConfigManager
 from core.models import QuotaItem, QuotaSnapshot
 from core.oauth import GoogleOAuthClient
+from utils.antigravity_auth import (
+    extract_all_antigravity_accounts,
+    extract_latest_antigravity_account_and_token,
+    get_antigravity_http_port_from_logs,
+)
 from utils.logger import logger
 
 try:
@@ -60,27 +65,31 @@ class GeminiQuotaFetcher:
         self._cached_ls_csrf: Optional[str] = None
 
     def _query_local_ls(self, port: int, csrf_token: str) -> Optional[Dict[str, Any]]:
-        """Queries local Antigravity Language Server RPC for live quota summary."""
+        """Queries local Antigravity Language Server RPC for live quota summary with failover."""
         url = f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
-        body = json.dumps({"forceRefresh": True}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Codeium-Csrf-Token": csrf_token,
-                "Connect-Protocol-Version": "1",
-            },
-        )
-        try:
-            # Bypass system/SOCKS proxies to directly hit localhost RPC
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(req, timeout=1.5) as resp:
-                if resp.getcode() == 200:
-                    raw = resp.read().decode("utf-8", errors="ignore")
-                    return json.loads(raw)
-        except Exception:
-            return None
+        # First attempt forceRefresh: True with 4.0s timeout; fallback to forceRefresh: False with 2.0s timeout
+        for force_ref in [True, False]:
+            body = json.dumps({"forceRefresh": force_ref}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Codeium-Csrf-Token": csrf_token,
+                    "Connect-Protocol-Version": "1",
+                },
+            )
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                timeout = 4.0 if force_ref else 2.0
+                with opener.open(req, timeout=timeout) as resp:
+                    if resp.getcode() == 200:
+                        raw = resp.read().decode("utf-8", errors="ignore")
+                        data = json.loads(raw)
+                        if data and ("groups" in data or "response" in data):
+                            return data
+            except Exception:
+                continue
         return None
 
     def _query_local_user_status(self, port: int, csrf_token: str) -> Optional[Dict[str, Any]]:
@@ -97,7 +106,7 @@ class GeminiQuotaFetcher:
         )
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(req, timeout=1.5) as resp:
+            with opener.open(req, timeout=3.0) as resp:
                 if resp.getcode() == 200:
                     raw = resp.read().decode("utf-8", errors="ignore")
                     return json.loads(raw)
@@ -116,9 +125,11 @@ class GeminiQuotaFetcher:
             self._cached_ls_port = None
             self._cached_ls_csrf = None
 
-        # 2. Discover via psutil
+        # 2. Discover via psutil and log files
         try:
             import psutil
+            log_port = get_antigravity_http_port_from_logs()
+
             for p in psutil.process_iter(["name"]):
                 try:
                     name = (p.info["name"] or "").lower()
@@ -129,20 +140,30 @@ class GeminiQuotaFetcher:
                             continue
                         csrf_token = csrf_match.group(1)
 
-                        # Check listening ports
-                        for conn in p.net_connections(kind="tcp"):
-                            if conn.status == psutil.CONN_LISTEN:
-                                port = conn.laddr.port
-                                data = self._query_local_ls(port, csrf_token)
-                                if data and ("groups" in data or "response" in data):
-                                    self._cached_ls_port = port
-                                    self._cached_ls_csrf = csrf_token
-                                    user_data = self._query_local_user_status(port, csrf_token)
-                                    return data, user_data
+                        candidate_ports: List[int] = []
+                        if log_port:
+                            candidate_ports.append(log_port)
+
+                        # Also inspect listening tcp ports from process if permission allows
+                        try:
+                            for conn in p.net_connections(kind="tcp"):
+                                if conn.status == psutil.CONN_LISTEN:
+                                    if conn.laddr.port not in candidate_ports:
+                                        candidate_ports.append(conn.laddr.port)
+                        except Exception:
+                            pass
+
+                        for port in candidate_ports:
+                            data = self._query_local_ls(port, csrf_token)
+                            if data and ("groups" in data or "response" in data):
+                                self._cached_ls_port = port
+                                self._cached_ls_csrf = csrf_token
+                                user_data = self._query_local_user_status(port, csrf_token)
+                                return data, user_data
                 except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                     continue
         except Exception as e:
-            logger.debug(f"psutil discovery error: {e}")
+            logger.debug(f"Antigravity language server discovery error: {e}")
 
         return None
 
@@ -245,16 +266,16 @@ class GeminiQuotaFetcher:
         return DEFAULT_PROJECT_ID
 
     def fetch(self) -> QuotaSnapshot:
-        """Fetches quota snapshot from Google CloudCode-PA API."""
+        """Fetches quota snapshot with automatic multi-account detection, account switching, and failover."""
         cfg = self.config_manager.config.gemini
-        account_email = cfg.account_email or "Google Account"
 
         # Check if simulator mode is active
         if self.config_manager.config.general.active_source == "simulator":
             return self._generate_simulated_snapshot()
 
-        # Priority 1: Direct Live Link to local Antigravity IDE
-        # If Antigravity IDE is running, this gives the exact 100% synchronized live quota & countdowns with zero proxy/latency.
+        proxy_url = self.config_manager.config.proxy.get_proxy_url()
+
+        # Priority 1: Direct Live Link to local Antigravity IDE Language Server
         try:
             ls_result = self._fetch_from_antigravity_ls()
             if ls_result:
@@ -264,33 +285,56 @@ class GeminiQuotaFetcher:
                     user_email = ""
                     user_name = ""
                     plan_name = ""
-                    if user_payload and isinstance(user_payload, dict) and "userStatus" in user_payload:
-                        us = user_payload.get("userStatus", {})
-                        user_email = str(us.get("email") or "").strip()
-                        user_name = str(us.get("name") or "").strip()
-                        plan_info = us.get("userTier") or us.get("planStatus", {}).get("planInfo", {})
-                        if isinstance(plan_info, dict):
-                            plan_name = str(plan_info.get("name") or plan_info.get("planName") or "").strip()
+                    if user_payload and isinstance(user_payload, dict):
+                        us = user_payload.get("userStatus", {}) or user_payload.get("user_status", {})
+                        if isinstance(us, dict):
+                            user_email = str(us.get("email") or us.get("user_email") or us.get("emailAddress") or us.get("username") or "").strip()
+                            user_name = str(us.get("name") or us.get("user_name") or us.get("displayName") or "").strip()
+                            plan_info = us.get("userTier") or us.get("planStatus", {}).get("planInfo", {})
+                            if isinstance(plan_info, dict):
+                                plan_name = str(plan_info.get("name") or plan_info.get("planName") or "").strip()
 
-                    active_email = user_email or account_email or "Antigravity Active User"
+                    latest_acc = extract_latest_antigravity_account_and_token(proxy_url=proxy_url)
+                    if not user_email and latest_acc:
+                        user_email = latest_acc.get("email", "")
+                        user_name = user_name or latest_acc.get("name", "")
+
+                    discovered_accounts = extract_all_antigravity_accounts(proxy_url=proxy_url)
+                    active_rt = ""
+                    for d_acc in discovered_accounts:
+                        if user_email and d_acc.get("email", "").lower() == user_email.lower():
+                            active_rt = d_acc.get("refresh_token", "")
+                            break
+                    if not active_rt and latest_acc:
+                        active_rt = latest_acc.get("refresh_token", "")
+
+                    active_email = user_email or cfg.account_email or "Antigravity Active User"
+
+                    # Sync config if account switched or refresh token discovered
+                    if user_email:
+                        changed = False
+                        if cfg.account_email != user_email:
+                            logger.info(f"Detected Antigravity account switch: '{cfg.account_email}' -> '{user_email}'")
+                            cfg.account_email = user_email
+                            changed = True
+                        if active_rt and (cfg.refresh_token != active_rt or not cfg.refresh_token):
+                            cfg.refresh_token = active_rt
+                            changed = True
+                        if changed:
+                            self.config_manager.save()
 
                     # Automatically update multi-account manager
-                    if user_email:
-                        try:
-                            from core.account_manager import get_account_manager
-                            from utils.antigravity_auth import extract_antigravity_tokens
-                            acc_mgr = get_account_manager()
+                    try:
+                        from core.account_manager import get_account_manager
+                        acc_mgr = get_account_manager()
+                        acc_mgr.load()
 
-                            _, extracted_rt = extract_antigravity_tokens()
-                            if extracted_rt and not cfg.refresh_token:
-                                cfg.refresh_token = extracted_rt
-                                self.config_manager.save()
+                        item_5h = next((it for it in items if "5h" in it.id.lower() and "claude" not in it.id.lower()), None)
+                        item_week = next((it for it in items if ("weekly" in it.id.lower() or "week" in it.id.lower()) and "claude" not in it.id.lower()), None)
+                        item_c5h = next((it for it in items if "claude" in it.id.lower() and "5h" in it.id.lower()), None)
+                        item_cweek = next((it for it in items if "claude" in it.id.lower() and ("weekly" in it.id.lower() or "week" in it.id.lower())), None)
 
-                            item_5h = next((it for it in items if "5h" in it.id.lower() and "claude" not in it.id.lower()), None)
-                            item_week = next((it for it in items if ("weekly" in it.id.lower() or "week" in it.id.lower()) and "claude" not in it.id.lower()), None)
-                            item_c5h = next((it for it in items if "claude" in it.id.lower() and "5h" in it.id.lower()), None)
-                            item_cweek = next((it for it in items if "claude" in it.id.lower() and ("weekly" in it.id.lower() or "week" in it.id.lower())), None)
-
+                        if user_email:
                             acc_mgr.update_or_add_account(
                                 email=user_email,
                                 name=user_name,
@@ -304,11 +348,25 @@ class GeminiQuotaFetcher:
                                 claude_weekly_remaining=item_cweek.remaining if item_cweek else 100.0,
                                 claude_weekly_reset_time=item_cweek.reset_time if item_cweek else None,
                                 is_active=True,
-                                refresh_token=extracted_rt or "",
+                                refresh_token=active_rt or "",
                                 quota_source="api",
                             )
-                        except Exception as acc_err:
-                            logger.debug(f"AccountManager update error: {acc_err}")
+
+                        # Register any other discovered offline accounts into the pool
+                        for disc in discovered_accounts:
+                            d_em = disc.get("email", "").strip()
+                            d_tok = disc.get("refresh_token", "").strip()
+                            if d_em and d_em.lower() != user_email.lower() and d_tok:
+                                if d_em.lower() not in acc_mgr.accounts:
+                                    acc_mgr.update_or_add_account(
+                                        email=d_em,
+                                        name=disc.get("name", ""),
+                                        is_active=False,
+                                        refresh_token=d_tok,
+                                        quota_source="estimated",
+                                    )
+                    except Exception as acc_err:
+                        logger.debug(f"AccountManager sync error: {acc_err}")
 
                     logger.info(f"Successfully fetched {len(items)} live quota items directly from local Antigravity IDE (User: {active_email})")
                     return QuotaSnapshot(
@@ -323,69 +381,98 @@ class GeminiQuotaFetcher:
         except Exception as e:
             logger.debug(f"Local Antigravity fetch attempt failed: {e}")
 
-        try:
-            access_token = self._ensure_valid_token()
-        except Exception as e:
+        # Priority 2: Remote Google API fallback
+        logger.info("Local Antigravity LS not available, running remote API fallback...")
+
+        latest_acc = extract_latest_antigravity_account_and_token(proxy_url=proxy_url)
+        target_rt = ""
+        target_email = ""
+        target_name = ""
+
+        if latest_acc and latest_acc.get("refresh_token"):
+            target_rt = latest_acc["refresh_token"]
+            target_email = latest_acc.get("email", "")
+            target_name = latest_acc.get("name", "")
+
+        if not target_rt:
+            target_rt = cfg.refresh_token.strip()
+            target_email = cfg.account_email.strip()
+
+        if not target_rt:
             return QuotaSnapshot(
                 source_name="Google Gemini",
-                account_label=account_email,
+                account_label=cfg.account_email or "未登录",
                 status="unauthorized",
-                error_message=str(e),
+                error_message="未检测到 Antigravity IDE 登录状态或 Google 账号，请在 IDE 中登录",
             )
 
-        session = self._build_session()
-        project_id = self._resolve_project_id(session, access_token)
+        # Sync config if account switched
+        if target_email and cfg.account_email != target_email:
+            logger.info(f"Detected account switch in state.vscdb: '{cfg.account_email}' -> '{target_email}'")
+            cfg.account_email = target_email
+            cfg.refresh_token = target_rt
+            self.config_manager.save()
+        elif target_rt and not cfg.refresh_token:
+            cfg.refresh_token = target_rt
+            self.config_manager.save()
 
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "User-Agent": ANTIGRAVITY_USER_AGENT,
-        }
-        body = {"project": project_id}
-
-        last_error = ""
-        payload = None
-
-        for endpoint in QUOTA_SUMMARY_ENDPOINTS:
-            try:
-                resp = session.post(endpoint, json=body, headers=headers, timeout=15)
-                if resp.status_code == 401:
-                    # Token might have been revoked; attempt one force refresh
-                    logger.warning("Got 401, trying to force refresh access token...")
-                    if cfg.refresh_token:
-                        token_data = self.oauth_client.refresh_access_token(cfg.refresh_token)
-                        access_token = token_data.get("access_token", "")
-                        if access_token:
-                            cfg.access_token = access_token
-                            cfg.token_expiry = (datetime.now() + timedelta(seconds=token_data.get("expires_in", 3600))).isoformat()
-                            self.config_manager.save()
-                            headers["Authorization"] = f"Bearer {access_token}"
-                            resp = session.post(endpoint, json=body, headers=headers, timeout=15)
-
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    break
-                else:
-                    last_error = f"HTTP {resp.status_code}: {resp.text[:120]}"
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Error querying {endpoint}: {e}")
-
-        if not payload:
+        items = self.fetch_quota_via_refresh_token(target_rt)
+        if not items:
             return QuotaSnapshot(
                 source_name="Google Gemini",
-                account_label=account_email,
-                project_id=project_id,
+                account_label=cfg.account_email or target_email or "Google Account",
                 status="error",
-                error_message=last_error or "请求额度接口失败",
+                error_message="请求额度接口失败或连接超时",
             )
 
-        items = self._parse_quota_payload(payload)
+        acc_email = target_email or cfg.account_email or "Google Account"
+
+        # Register / Update active account in AccountManager
+        try:
+            from core.account_manager import get_account_manager
+            acc_mgr = get_account_manager()
+            acc_mgr.load()
+
+            item_5h = next((it for it in items if "5h" in it.id.lower() and "claude" not in it.id.lower()), None)
+            item_week = next((it for it in items if ("weekly" in it.id.lower() or "week" in it.id.lower()) and "claude" not in it.id.lower()), None)
+            item_c5h = next((it for it in items if "claude" in it.id.lower() and "5h" in it.id.lower()), None)
+            item_cweek = next((it for it in items if "claude" in it.id.lower() and ("weekly" in it.id.lower() or "week" in it.id.lower())), None)
+
+            acc_mgr.update_or_add_account(
+                email=acc_email,
+                name=target_name,
+                is_active=True,
+                refresh_token=target_rt,
+                gemini_5h_remaining=item_5h.remaining if item_5h else 100.0,
+                gemini_5h_reset_time=item_5h.reset_time if item_5h else None,
+                gemini_weekly_remaining=item_week.remaining if item_week else 100.0,
+                gemini_weekly_reset_time=item_week.reset_time if item_week else None,
+                claude_5h_remaining=item_c5h.remaining if item_c5h else 100.0,
+                claude_5h_reset_time=item_c5h.reset_time if item_c5h else None,
+                claude_weekly_remaining=item_cweek.remaining if item_cweek else 100.0,
+                claude_weekly_reset_time=item_cweek.reset_time if item_cweek else None,
+                quota_source="api",
+            )
+
+            for disc in extract_all_antigravity_accounts(proxy_url=proxy_url):
+                d_em = disc.get("email", "").strip()
+                d_tok = disc.get("refresh_token", "").strip()
+                if d_em and d_em.lower() != acc_email.lower() and d_tok:
+                    if d_em.lower() not in acc_mgr.accounts:
+                        acc_mgr.update_or_add_account(
+                            email=d_em,
+                            name=disc.get("name", ""),
+                            is_active=False,
+                            refresh_token=d_tok,
+                            quota_source="estimated",
+                        )
+        except Exception as acc_err:
+            logger.debug(f"AccountManager sync error in fallback: {acc_err}")
 
         return QuotaSnapshot(
             source_name="Google Gemini",
-            account_label=account_email,
-            project_id=project_id,
+            account_label=acc_email,
+            project_id=DEFAULT_PROJECT_ID,
             items=items,
             status="ok",
         )
