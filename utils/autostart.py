@@ -33,8 +33,15 @@ def set_autostart(enabled: bool) -> bool:
                 if getattr(sys, "frozen", False):
                     exe_path = f'"{sys.executable}"'
                 else:
-                    main_py = Path(__file__).resolve().parent.parent / "main.py"
-                    exe_path = f'"{sys.executable}" "{main_py}"'
+                    dist_exe = Path(__file__).resolve().parent.parent / "dist" / "GeminiQuotaMonitor.exe"
+                    if dist_exe.exists():
+                        exe_path = f'"{dist_exe}"'
+                    else:
+                        python_exe = Path(sys.executable)
+                        pythonw_exe = python_exe.parent / "pythonw.exe"
+                        py_bin = str(pythonw_exe) if pythonw_exe.exists() else str(python_exe)
+                        main_py = Path(__file__).resolve().parent.parent / "main.py"
+                        exe_path = f'"{py_bin}" "{main_py}"'
                 
                 winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
                 print(f"[Autostart] Enabled: {exe_path}")
